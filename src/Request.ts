@@ -14,13 +14,15 @@ export class Request {
     public cycleTLS: any = null;
 
     async init(): Promise<void> {
-        // CycleTLS n'est plus utilisé, cette méthode est vide
+        console.log('✅ Request client initialisé (fetch natif)');
         return Promise.resolve();
     }
 
     async fetch(method: string, url: string, options: FetchOptions = {}): Promise<CycleTLSResponse> {
         return new Promise(async (resolve, reject) => {
             try {
+                console.log(`🔗 ${method} ${url}`);
+                
                 const response = await fetch(url, {
                     method: method,
                     headers: options.headers,
@@ -49,12 +51,15 @@ export class Request {
                     headers[key] = value;
                 });
 
+                console.log(`📡 Response status: ${response.status} for ${method} ${url}`);
+
                 resolve({
                     status: response.status,
                     body: body,
                     headers: headers
                 });
             } catch (error) {
+                console.error(`❌ Erreur fetch ${method} ${url}:`, error);
                 reject(error);
             }
         });
