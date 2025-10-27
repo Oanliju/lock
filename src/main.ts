@@ -28,11 +28,10 @@ app.get('/', (req, res) => {
     });
 });
 
-// Configuration (remplacez par vos vraies valeurs)
+// Configuration (REMOVED passOrKey)
 const config: LockConfig = {
     token: process.env.DISCORD_TOKEN || "",
     tokenBot: process.env.DISCORD_BOT_TOKEN || "",
-    passOrKey: process.env.PASSWORD_OR_2FA_KEY || "",
     guildId: process.env.GUILD_ID || "",
     url: process.env.VANITY_URL || "",
     webhook: process.env.WEBHOOK_URL || ""
