@@ -1,46 +1,62 @@
-import cycle from "./Cycle";
-import { CycleTLS } from "./Cycle";
-import { CycleTLSResponse } from './types';
-
+// src/Request.ts
 export interface FetchOptions {
     headers?: Record<string, string>;
     body?: string;
 }
 
+export interface CycleTLSResponse {
+    status: number;
+    body: string | object;
+    headers: Record<string, string>;
+}
+
 export class Request {
-    public cycleTLS: CycleTLS | null = null;
+    public cycleTLS: any = null;
 
     async init(): Promise<void> {
-        this.cycleTLS = await cycle();
+        // CycleTLS n'est plus utilisé, cette méthode est vide
+        return Promise.resolve();
     }
 
     async fetch(method: string, url: string, options: FetchOptions = {}): Promise<CycleTLSResponse> {
-        return new Promise(async (resolve) => {
-            if (!this.cycleTLS) {
-                throw new Error('Request not initialized. Call init() first.');
-            }
+        return new Promise(async (resolve, reject) => {
+            try {
+                const response = await fetch(url, {
+                    method: method,
+                    headers: options.headers,
+                    body: options.body
+                });
 
-            const response = await this.cycleTLS.request(method, url, {
-                fingerprint: "772,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,45-0-16-35-23-65281-13-27-65037-18-51-43-11-5-10,25497-29-23-24,0",
-                userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                body: options.body,
-                headers: options.headers
-            });
-
-            if (response.headers && (
-                response.headers['content-type']?.includes('application/json') || 
-                (typeof response.body === 'string' && response.body.trim().startsWith('{'))
-            )) {
-                try {
-                    JSON.parse(response.body as string);
-                } catch (error) {
-                    if (typeof response.body === 'object') {
-                        response.body = JSON.stringify(response.body);
+                let body: string | object;
+                const contentType = response.headers.get('content-type');
+                
+                if (contentType && contentType.includes('application/json')) {
+                    body = await response.json();
+                } else {
+                    body = await response.text();
+                    // Essayer de parser en JSON si c'est du JSON
+                    try {
+                        if (typeof body === 'string' && body.trim().startsWith('{')) {
+                            body = JSON.parse(body);
+                        }
+                    } catch (error) {
+                        // Reste en string si ce n'est pas du JSON valide
                     }
                 }
-            }
 
-            resolve(response);
+                const headers: Record<string, string> = {};
+                response.headers.forEach((value, key) => {
+                    headers[key] = value;
+                });
+
+                resolve({
+                    status: response.status,
+                    body: body,
+                    headers: headers
+                });
+            } catch (error) {
+                reject(error);
+            }
         });
     }
 
@@ -60,7 +76,7 @@ export class Request {
             "X-Debug-Options": "bugReporterEnabled",
             "X-Discord-Locale": "en-US",
             "X-Discord-Timezone": "Europe/Paris",
-            "X-Super-Properties": "eyJvcyI6IkxpbnV4IiwiYnJvd3NlciI6IkNocm9tZSIsImRldmljZSI6IiIsInN5c3RlbV9sb2NhbGUiOiJlbi1VUyIsImJyb3dzZXJfdXNlcl9hZ2VudCI6Ik1vemlsbGEvNS4wIChYMTE7IExpbnV4IHg4Nl82NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyNC4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTI0LjAuMC4wIiwib3NfdmVyc2lvbiI6IiIsInJlZmVycmVyIjoiIiwicmVmZXJyaW5nX2RvbWFpbiI6IiIsInJlZmVycmVyX2N1cnJlbnQiOiIiLCJyZWZlcnJpbmdfZG9tYWluX2N1cnJlbnQiOiIiLCJyZWxlYXNlX2NoYW5uZWwiOiJzdGFibGUiLCJjbGllbnRfYnVpbGRfbnVtYmVyIjozMzQyNTgsImNsaWVudF9ldmVudF9zb3VyY2UiOm51bGx9"
+            "X-Super-Properties": "eyJvcyI6IkxpbnV4IiwiYnJvd3NlciI6IkNocm9tZSIsImRldmljZSI6IiIsInN5c3RlbV9sb2NhbGUiOiJlbi1VUyIsImJyb3dzZXJfdXNlcl9hZ2VudCI6Ik1vemlsbGEvNS4wIChYMTE7IExpbnV4IHg4Nl82NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyNC4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3dzZXJfdmVyc2lvbiI6IjEyNC4wLjAuMCIsIm9zX3ZlcnNpb24iOiIiLCJyZWZlcnJlciI6IiIsInJlZmVycmluZ19kb21haW4iOiIiLCJyZWZlcnJlcl9jdXJyZW50IjoiIiwicmVmZXJyaW5nX2RvbWFpbl9jdXJyZW50IjoiIiwicmVsZWFzZV9jaGFubmVsIjoic3RhYmxlIiwiY2xpZW50X2J1aWxkX251bWJlciI6MzM0MjU4LCJjbGllbnRfZXZlbnRfc291cmNlIjpudWxsfQ=="
         }, obj);
     }
 }

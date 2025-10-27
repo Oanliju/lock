@@ -28,14 +28,6 @@ app.get('/', (req, res) => {
     });
 });
 
-// Route pour vérifier le statut du lock
-app.get('/status', (req, res) => {
-    res.json({
-        lockActive: lockInstance !== undefined,
-        service: 'running'
-    });
-});
-
 // Configuration (remplacez par vos vraies valeurs)
 const config: LockConfig = {
     token: process.env.DISCORD_TOKEN || "",
@@ -55,7 +47,7 @@ const createLockInstance = () => {
         console.log('✅ Lock initialisé avec succès');
     } catch (error) {
         console.error('❌ Erreur lors de l\'initialisation du Lock:', error);
-        setTimeout(createLockInstance, 5000);
+        setTimeout(createLockInstance, 10000);
     }
 };
 
@@ -100,5 +92,3 @@ process.on('unhandledRejection', (reason) => {
     if (lockInstance) lockInstance.cleanup(); 
     setTimeout(createLockInstance, 10000);
 });
-
-export { app, server };
