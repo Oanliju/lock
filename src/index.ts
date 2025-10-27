@@ -30,7 +30,8 @@ interface DiscordRole {
 
 interface MfaTicket {
     ticket: string;
-    data: string;
+    code?: string;
+    password?: string;
 }
 
 interface MfaResponse {
@@ -39,7 +40,9 @@ interface MfaResponse {
 
 interface DiscordApiResponse {
     code?: number;
-    mfa?: MfaResponse;
+    message?: string;
+    mfa?: boolean;
+    mfa_ticket?: string;
     retry_after?: number;
     token?: string;
 }
@@ -94,7 +97,9 @@ export class Lock {
             authorization: `Bot ${this.config.tokenBot}`, 
             "content-type": "application/json" 
         });
-        this.bot = new Client({ intents: [GatewayIntentBits.Guilds] });
+        this.bot = new Client({ 
+            intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] 
+        });
         this.baseRate = { "patchRole": 1000 };
         this.recent_mfa = '';
         this.method = '';
@@ -119,90 +124,155 @@ export class Lock {
             await this.detectTimeOffset();
             console.log('⏰ Décalage horaire détecté:', this.timeOffset);
             
-            const tokenResponse = await fetch("https://discord.com/api/v9/users/@me", { method: "GET", headers: this.headers });
+            // Vérifier le token utilisateur
+            const tokenResponse = await fetch("https://discord.com/api/v9/users/@me", { 
+                method: "GET", 
+                headers: this.headers 
+            });
+            
             if (tokenResponse.status !== 200) {
-                console.log('❌ Token utilisateur invalide');
+                console.log('❌ Token utilisateur invalide - Statut:', tokenResponse.status);
+                const errorText = await tokenResponse.text();
+                console.log('❌ Erreur détaillée:', errorText);
                 return;
             }
             
-            const guildResponse = await fetch(`https://discord.com/api/v9/guilds/${this.config.guildId}`, { method: "GET", headers: this.headers });
-            if (guildResponse.status !== 200) {
-                console.log('❌ Serveur inaccessible');
-                return;
-            }
-            
-            await this.rest.init();
             const userData: DiscordUser = await tokenResponse.json();
-            this.method = userData.mfa_enabled === true ? "totp" : "password";
+            console.log('👤 Utilisateur connecté:', userData.username);
+            this.method = userData.mfa_enabled ? "totp" : "password";
             console.log(`🔐 Méthode d'authentification: ${this.method}`);
             
+            // Vérifier l'accès au serveur
+            const guildResponse = await fetch(`https://discord.com/api/v9/guilds/${this.config.guildId}`, { 
+                method: "GET", 
+                headers: this.headers 
+            });
+            
+            if (guildResponse.status !== 200) {
+                console.log('❌ Serveur inaccessible - Statut:', guildResponse.status);
+                const errorText = await guildResponse.text();
+                console.log('❌ Erreur détaillée:', errorText);
+                return;
+            }
+            
+            console.log('✅ Serveur accessible');
+            await this.rest.init();
+
+            // Créer le token temporaire et démarrer le lock
             const jwt = await this.createTemporaryToken();
             if (jwt) {
-                console.log('✅ Token temporaire créé');
-                this.lockURL(true);
+                console.log('✅ Token temporaire créé avec succès');
                 this.recent_mfa = jwt;
+                this.lockURL(true);
+                
+                // Renouveler le token périodiquement
                 setInterval(async () => {
                     console.log('🔄 Renouvellement du token temporaire...');
                     const newJwt = await this.createTemporaryToken();
                     if (newJwt) {
                         this.recent_mfa = newJwt;
                         console.log('✅ Token temporaire renouvelé');
+                    } else {
+                        console.log('❌ Échec du renouvellement du token');
                     }
-                }, 300000);
+                }, 300000); // 5 minutes
+            } else {
+                console.log('❌ Impossible de créer le token temporaire, réessai dans 10s');
+                setTimeout(() => this.initClient(), 10000);
             }
         } catch (error) {
             console.error('❌ Erreur lors de l\'initialisation:', error);
+            setTimeout(() => this.initClient(), 10000);
         }
     }
 
     private createTemporaryToken = async (): Promise<string | null> => {
         return new Promise(async (resolve) => {
             try {
-                console.log('🔑 Création du token temporaire...');
-                const patch = await this.patch();
+                console.log('🔑 Tentative de création du token temporaire...');
+                
+                // D'abord, essayer de récupérer l'URL vanity pour déclencher le MFA
+                const patchResponse = await this.patch();
+                
+                if (patchResponse.status === 200) {
+                    console.log('✅ URL déjà lockée, pas besoin de MFA');
+                    resolve("no-mfa-needed");
+                    return;
+                }
+
                 let responseData: DiscordApiResponse;
-                if (typeof patch.body === 'object') {
-                    responseData = patch.body as DiscordApiResponse;
+                if (typeof patchResponse.body === 'object') {
+                    responseData = patchResponse.body as DiscordApiResponse;
                 } else {
                     try {
-                        responseData = JSON.parse(patch.body as string);
+                        responseData = JSON.parse(patchResponse.body as string);
                     } catch (error) {
-                        console.log('❌ Erreur parsing réponse patch');
+                        console.log('❌ Erreur parsing réponse patch:', patchResponse.body);
                         return resolve(null);
                     }
                 }
-                const { code, mfa } = responseData;
-                if (code === 60003 && mfa) {
-                    console.log('🔐 MFA requis, génération du code...');
-                    let totpCode = '';
+
+                console.log('📋 Réponse patch:', responseData);
+
+                // Vérifier si MFA est requis
+                if (responseData.code === 60003 || responseData.mfa) {
+                    console.log('🔐 MFA requis, traitement...');
+                    
+                    let mfaTicket = responseData.mfa_ticket;
+                    if (!mfaTicket && (responseData as any).ticket) {
+                        mfaTicket = (responseData as any).ticket;
+                    }
+
+                    if (!mfaTicket) {
+                        console.log('❌ Ticket MFA non trouvé dans la réponse');
+                        return resolve(null);
+                    }
+
+                    console.log('🎫 Ticket MFA obtenu:', mfaTicket);
+
+                    let mfaData: any = {};
                     if (this.method === "totp") {
-                        totpCode = await this.tryTOTPWithRetry(this.config.passOrKey);
+                        const totpCode = await this.tryTOTPWithRetry(this.config.passOrKey);
                         if (!totpCode) {
                             console.log('❌ Impossible de générer le code TOTP');
                             return resolve(null);
                         }
-                    }
-                    const finish = await this.finish({ ticket: mfa.ticket, data: this.method === "password" ? this.config.passOrKey : totpCode });
-                    let finishData: DiscordApiResponse;
-                    if (typeof finish.body === 'object') {
-                        finishData = finish.body as DiscordApiResponse;
+                        mfaData.code = totpCode;
                     } else {
-                        try {
-                            finishData = JSON.parse(finish.body as string);
-                        } catch (error) {
-                            console.log('❌ Erreur parsing réponse finish');
-                            return resolve(null);
+                        // Mode password
+                        mfaData.password = this.config.passOrKey;
+                    }
+
+                    // Utiliser le bon endpoint MFA
+                    const finishResponse = await this.finishMFA(mfaTicket, mfaData);
+                    
+                    if (finishResponse.status === 200) {
+                        let finishData: DiscordApiResponse;
+                        if (typeof finishResponse.body === 'object') {
+                            finishData = finishResponse.body as DiscordApiResponse;
+                        } else {
+                            try {
+                                finishData = JSON.parse(finishResponse.body as string);
+                            } catch (error) {
+                                console.log('❌ Erreur parsing réponse finish');
+                                return resolve(null);
+                            }
                         }
-                    }
-                    if (finish.status === 200 && finishData.token) {
-                        console.log('✅ Token MFA obtenu avec succès');
-                        resolve(finishData.token);
+
+                        if (finishData.token) {
+                            console.log('✅ Token MFA obtenu avec succès');
+                            resolve(finishData.token);
+                        } else {
+                            console.log('❌ Token non trouvé dans la réponse finish');
+                            resolve(null);
+                        }
                     } else {
-                        console.log('❌ Échec de l\'obtention du token MFA');
+                        console.log(`❌ Échec de l'authentification MFA - Statut: ${finishResponse.status}`);
+                        console.log('📋 Réponse finish:', finishResponse.body);
                         resolve(null);
                     }
                 } else {
-                    console.log('❌ Pas de MFA requis ou code différent');
+                    console.log('❌ Pas de MFA requis ou code différent:', responseData.code);
                     resolve(null);
                 }
             } catch (error) {
@@ -212,17 +282,17 @@ export class Lock {
         });
     }
 
-    private patch = async (headers?: Record<string, string>) => {
+    private patch = async (headers?: Record<string, string>): Promise<any> => {
         try {
             console.log('🔄 Tentative de lock de l\'URL...');
-            const result = await this.rest.fetch("PATCH", `https://discord.com/api/v9/guilds/${this.config.guildId}/vanity-url`, { 
-                headers: { ...this.headers, ...headers }, 
-                body: JSON.stringify({ code: this.config.url }) 
-            });
-            
-            if (!result || typeof result.status === 'undefined' || !result.body) {
-                throw new Error('Invalid response');
-            }
+            const result = await this.rest.fetch(
+                "PATCH", 
+                `https://discord.com/api/v9/guilds/${this.config.guildId}/vanity-url`, 
+                { 
+                    headers: { ...this.headers, ...headers }, 
+                    body: JSON.stringify({ code: this.config.url }) 
+                }
+            );
             
             return result;
         } catch (error) {
@@ -231,17 +301,30 @@ export class Lock {
         }
     }
 
-    private finish = async ({ ticket, data }: MfaTicket) => {
+    private finishMFA = async (ticket: string, mfaData: any): Promise<any> => {
         try {
             console.log('✅ Finalisation MFA...');
-            const result = await this.rest.fetch("POST", "https://discord.com/api/v9/mfa/finish", { 
-                headers: this.headers, 
-                body: JSON.stringify({ mfa_type: this.method, ticket, data }) 
-            });
             
-            if (!result || typeof result.status === 'undefined' || !result.body) {
-                throw new Error('Invalid response');
+            const payload: any = {
+                ticket: ticket
+            };
+
+            if (this.method === "totp") {
+                payload.code = mfaData.code;
+            } else {
+                payload.password = mfaData.password;
             }
+
+            console.log('📦 Payload MFA:', payload);
+
+            const result = await this.rest.fetch(
+                "POST", 
+                "https://discord.com/api/v9/auth/mfa/totp", 
+                { 
+                    headers: this.headers, 
+                    body: JSON.stringify(payload) 
+                }
+            );
             
             return result;
         } catch (error) {
@@ -258,64 +341,102 @@ export class Lock {
         
         let retry_after = 0;
         let i = 0;
+        const maxAttempts = 50; // Limite pour éviter les boucles infinies
+        
         console.log('🎯 Début de la boucle de lock...');
         
-        for (i; i < Infinity; ++i) {
+        for (i = 0; i < maxAttempts; ++i) {
             try {
-                console.log(`🔄 Tentative ${i + 1}...`);
-                let patch = await Promise.race([
-                    this.patch({ Cookie: `__Secure-recent_mfa=${this.recent_mfa}` }),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('Request timeout')), 15000))
+                console.log(`🔄 Tentative ${i + 1}/${maxAttempts}...`);
+                
+                let patchResponse = await Promise.race([
+                    this.patch({ 
+                        Cookie: `__Secure-recent_mfa=${this.recent_mfa}`,
+                        "X-Discord-MFA-Authorization": this.recent_mfa 
+                    }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('Request timeout')), 30000))
                 ]) as any;
                 
                 let responseData: DiscordApiResponse;
                 try {
-                    responseData = typeof patch.body === 'object' ? patch.body as DiscordApiResponse : JSON.parse(patch.body as string);
+                    responseData = typeof patchResponse.body === 'object' 
+                        ? patchResponse.body as DiscordApiResponse 
+                        : JSON.parse(patchResponse.body as string);
                 } catch (error) {
-                    console.log('❌ Erreur parsing réponse');
+                    console.log('❌ Erreur parsing réponse patch');
                     continue;
                 }
-                
-                const { code, mfa, retry_after: rr } = responseData;
-                if (patch.status === 429) {
-                    console.log(`⏰ Rate limit - attente: ${rr || 10}s`);
-                    retry_after = ms(`${rr || 10}s`);
+
+                console.log(`📊 Statut: ${patchResponse.status}, Code: ${responseData.code}`);
+
+                if (patchResponse.status === 200) {
+                    console.log('🎉 SUCCÈS: URL lockée avec succès!');
                     break;
-                } else if (patch.status === 401 && code === 60003 && mfa) {
+                } else if (patchResponse.status === 429) {
+                    console.log(`⏰ Rate limit - attente: ${responseData.retry_after || 10}s`);
+                    retry_after = ms(`${responseData.retry_after || 10}s`);
+                    break;
+                } else if (patchResponse.status === 401 && (responseData.code === 60003 || responseData.mfa)) {
                     console.log('🔐 MFA requis pendant le lock...');
-                    let totpCode = '';
-                    if (this.method === "totp") {
-                        totpCode = await this.tryTOTPWithRetry(this.config.passOrKey);
-                        if (!totpCode) continue;
+                    
+                    let mfaTicket = responseData.mfa_ticket;
+                    if (!mfaTicket && (responseData as any).ticket) {
+                        mfaTicket = (responseData as any).ticket;
                     }
-                    const finish = await this.finish({ ticket: mfa.ticket, data: this.method === "password" ? this.config.passOrKey : totpCode });
-                    let finishData: DiscordApiResponse;
-                    try {
-                        finishData = typeof finish.body === 'object' ? finish.body as DiscordApiResponse : JSON.parse(finish.body as string);
-                    } catch (error) {
-                        console.log('❌ Erreur parsing réponse finish');
-                        continue;
+
+                    if (mfaTicket) {
+                        let mfaData: any = {};
+                        if (this.method === "totp") {
+                            const totpCode = await this.tryTOTPWithRetry(this.config.passOrKey);
+                            if (!totpCode) continue;
+                            mfaData.code = totpCode;
+                        } else {
+                            mfaData.password = this.config.passOrKey;
+                        }
+
+                        const finishResponse = await this.finishMFA(mfaTicket, mfaData);
+                        
+                        if (finishResponse.status === 200) {
+                            let finishData: DiscordApiResponse;
+                            try {
+                                finishData = typeof finishResponse.body === 'object' 
+                                    ? finishResponse.body as DiscordApiResponse 
+                                    : JSON.parse(finishResponse.body as string);
+                            } catch (error) {
+                                console.log('❌ Erreur parsing réponse finish');
+                                continue;
+                            }
+                            
+                            if (finishData.token) {
+                                console.log('✅ Nouveau token MFA obtenu');
+                                this.recent_mfa = finishData.token;
+                                // Réessayer avec le nouveau token
+                                patchResponse = await this.patch({ 
+                                    "X-Discord-MFA-Authorization": this.recent_mfa 
+                                });
+                            }
+                        }
                     }
-                    if (finish.status === 200 && finishData.token) {
-                        console.log('✅ Nouveau token MFA obtenu');
-                        this.recent_mfa = finishData.token;
-                        patch = await this.patch({ "X-Discord-MFA-Authorization": this.recent_mfa });
-                    }
-                } else if (patch.status === 200) {
-                    console.log('✅ URL lockée avec succès!');
                 }
+                
+                // Petite pause entre les tentatives
+                await this.sleep(1000);
+                
             } catch (error) {
                 console.error('❌ Erreur dans la boucle de lock:', error);
-                continue;
+                await this.sleep(2000);
             }
         }
         
+        // Log des résultats
         try {
-            console.log(`📊 Envoi des logs - ${i + 1} tentatives`);
+            const attemptsText = i + 1 > maxAttempts ? maxAttempts : i + 1;
+            console.log(`📊 Résumé - ${attemptsText} tentatives effectuées`);
+            
             await this.log({ 
                 embeds: [{ 
                     color: this.color, 
-                    description: `- Nombre d'essai${i + 1 > 1 ? 's' : ''} : ${i + 1}\n> Durée : ${format(new Date(retry_after), "HH'h' mm'm' ss's'")}`, 
+                    description: `- Tentatives: ${attemptsText}\n- Durée: ${format(new Date(retry_after), "HH'h' mm'm' ss's'")}\n- Statut: ${retry_after > 0 ? '⏰ En attente' : '✅ Terminé'}`,
                     footer: { text: this.footer } 
                 }], 
                 username: this.username, 
@@ -328,25 +449,20 @@ export class Lock {
         console.log('🔓 Réactivation des permissions...');
         await this.enablePermissions();
         
+        // Planifier le prochain lock
         if (retry_after > 0) {
-            const execAt = Date.now() + retry_after;
-            const prepTime = 30000;
-            const prepDelay = retry_after > prepTime ? retry_after - prepTime : 0;
-            console.log(`⏰ Prochain lock dans ${prepDelay}ms`);
-            setTimeout(async () => {
-                console.log('🔓 Préparation du prochain lock...');
-                await this.disablePermissions();
-                setTimeout(() => { 
-                    console.log('🎯 Relance du lock...');
-                    this.lockURL(true); 
-                }, execAt - Date.now());
-            }, prepDelay);
+            console.log(`⏰ Prochain lock dans ${retry_after}ms`);
+            setTimeout(() => {
+                console.log('🎯 Relance du lock après rate limit...');
+                this.lockURL(true);
+            }, retry_after);
         } else {
-            console.log('⏰ Prochain lock dans 10s');
-            setTimeout(() => { 
+            const nextDelay = 30000; // 30 secondes
+            console.log(`⏰ Prochain lock dans ${nextDelay}ms`);
+            setTimeout(() => {
                 console.log('🎯 Relance du lock...');
-                this.lockURL(true); 
-            }, 10000);
+                this.lockURL(true);
+            }, nextDelay);
         }
     }
 
@@ -369,21 +485,25 @@ export class Lock {
             for (const [, role] of targetRoles) {
                 try {
                     const originalPermissions = role.permissions.bitfield;
-                    const newPermissions = role.permissions.remove([PermissionFlagsBits.Administrator, PermissionFlagsBits.ManageChannels]);
-                    await role.setPermissions(newPermissions, "lockU");
+                    const newPermissions = role.permissions.remove([
+                        PermissionFlagsBits.Administrator, 
+                        PermissionFlagsBits.ManageChannels,
+                        PermissionFlagsBits.ManageGuild
+                    ]);
+                    await role.setPermissions(newPermissions, "LockURL - Security");
                     this.rolesCache.push({ id: role.id, permissions: originalPermissions });
                     modifiedCount++;
-                    console.log(`🔓 Rôle ${role.name} modifié`);
+                    console.log(`🔓 Rôle "${role.name}" modifié`);
                 } catch (error) {
-                    console.error(`❌ Erreur modification rôle:`, error);
+                    console.error(`❌ Erreur modification rôle ${role.name}:`, error);
                 }
-                await this.sleep(250);
+                await this.sleep(500);
             }
             
             await this.log({ 
                 embeds: [{ 
                     color: this.color, 
-                    description: `- ${modifiedCount}/${targetRoles.size} ${modifiedCount > 1 ? "roles modifiés" : "role modifié"}\n> Préparation du lock`, 
+                    description: `- ${modifiedCount}/${targetRoles.size} rôles désactivés\n- Préparation du lock`, 
                     footer: { text: this.footer } 
                 }], 
                 username: this.username, 
@@ -407,19 +527,19 @@ export class Lock {
             
             console.log(`🔓 Réactivation de ${this.rolesCache.length} rôles...`);
             const guild = await this.bot.guilds.fetch(this.config.guildId);
-            let index = 0;
+            let restoredCount = 0;
             
             for (let i = 0; i < this.rolesCache.length; ++i) {
                 const { id, permissions } = this.rolesCache[i];
                 try {
                     const role = await guild.roles.fetch(id);
                     if (role) {
-                        await role.setPermissions(permissions, "unlockU");
-                        index++;
-                        console.log(`🔓 Rôle ${role.name} réactivé`);
+                        await role.setPermissions(permissions, "LockURL - Restauration");
+                        restoredCount++;
+                        console.log(`🔓 Rôle "${role.name}" réactivé`);
                     }
                 } catch (error) {
-                    console.error(`❌ Erreur réactivation rôle:`, error);
+                    console.error(`❌ Erreur réactivation rôle ID ${id}:`, error);
                 }
                 await this.sleep(1000);
             }
@@ -427,14 +547,14 @@ export class Lock {
             await this.log({ 
                 embeds: [{ 
                     color: this.color, 
-                    description: `- ${index}/${this.rolesCache.length} ${index > 1 ? "roles réactivés" : "role réactivé"}`, 
+                    description: `- ${restoredCount}/${this.rolesCache.length} rôles réactivés\n- Lock terminé`, 
                     footer: { text: this.footer } 
                 }], 
                 username: this.username, 
                 avatar_url: this.avatar_url 
             });
             
-            console.log(`✅ ${index}/${this.rolesCache.length} rôles réactivés`);
+            console.log(`✅ ${restoredCount}/${this.rolesCache.length} rôles réactivés`);
             this.rolesCache = [];
             return true;
         } catch (error) {
@@ -444,12 +564,25 @@ export class Lock {
     }
 
     private log = async (data: WebhookData): Promise<Response> => {
-        console.log('📨 Envoi webhook...');
-        return await fetch(this.config.webhook, { 
-            method: "POST", 
-            headers: { "content-type": "application/json" }, 
-            body: JSON.stringify(data) 
-        });
+        try {
+            console.log('📨 Envoi webhook...');
+            const response = await fetch(this.config.webhook, { 
+                method: "POST", 
+                headers: { "content-type": "application/json" }, 
+                body: JSON.stringify(data) 
+            });
+            
+            if (!response.ok) {
+                console.log('❌ Erreur envoi webhook:', response.status);
+            } else {
+                console.log('✅ Webhook envoyé avec succès');
+            }
+            
+            return response;
+        } catch (error) {
+            console.error('❌ Erreur envoi webhook:', error);
+            throw error;
+        }
     }
 
     private sleep = (ms: number): Promise<void> => {
@@ -462,8 +595,7 @@ export class Lock {
             const serverTimes = await Promise.allSettled([
                 this.getServerTime('worldtimeapi.org', '/api/timezone/Etc/UTC'),
                 this.getServerTime('time.google.com', ''),
-                this.getServerTime('discord.com', '/api/v9/gateway'),
-                this.getServerTime('api.github.com', '')
+                this.getServerTime('discord.com', '/api/v9/gateway')
             ]);
             
             const validTimes: number[] = [];
@@ -477,10 +609,10 @@ export class Lock {
                 const avgServerTime = Math.floor(validTimes.reduce((a, b) => a + b, 0) / validTimes.length);
                 const localTime = Math.floor(Date.now() / 1000);
                 this.timeOffset = avgServerTime - localTime;
-                console.log(`⏰ Décalage horaire: ${this.timeOffset}s`);
+                console.log(`⏰ Décalage horaire calculé: ${this.timeOffset}s`);
             } else {
                 this.timeOffset = 0;
-                console.log('⏰ Décalage horaire: 0s (défaut)');
+                console.log('⏰ Décalage horaire: 0s (valeur par défaut)');
             }
         } catch (error) {
             console.error('❌ Erreur détection décalage horaire:', error);
@@ -491,7 +623,12 @@ export class Lock {
     private getServerTime = async (hostname: string, path: string): Promise<number | null> => {
         return new Promise((resolve) => {
             const startTime = Date.now();
-            const request = https.request({ hostname, path, method: 'HEAD', timeout: 5000 }, (response) => {
+            const request = https.request({ 
+                hostname, 
+                path, 
+                method: 'HEAD', 
+                timeout: 5000 
+            }, (response) => {
                 const networkDelay = Math.floor((Date.now() - startTime) / 2);
                 const dateHeader = response.headers.date;
                 if (dateHeader) {
@@ -501,8 +638,12 @@ export class Lock {
                     resolve(null);
                 }
             });
+            
             request.on('error', () => resolve(null));
-            request.on('timeout', () => { request.destroy(); resolve(null); });
+            request.on('timeout', () => { 
+                request.destroy(); 
+                resolve(null); 
+            });
             request.end();
         });
     }
@@ -510,57 +651,34 @@ export class Lock {
     private generateRobustTOTP = (secret: string): string => {
         const currentTime = Math.floor(Date.now() / 1000) + this.timeOffset;
         const totpWindow = Math.floor(currentTime / 30);
+        
         if (this.lastTotpCode && Math.floor(this.lastTotpTime / 30) === totpWindow) {
             console.log('🔐 Utilisation du code TOTP en cache');
             return this.lastTotpCode;
         }
-        const token = speakeasy.totp({ secret: secret, encoding: 'base32', time: currentTime, step: 30 });
+        
+        const token = speakeasy.totp({ 
+            secret: secret, 
+            encoding: 'base32', 
+            time: currentTime, 
+            step: 30 
+        });
+        
         this.lastTotpCode = token;
         this.lastTotpTime = currentTime;
         console.log('🔐 Nouveau code TOTP généré');
         return token;
     }
 
-    private generateTOTPWithMultipleWindows = (secret: string): string[] => {
-        console.log('🔐 Génération TOTP multi-fenêtres...');
-        const tokens: string[] = [];
-        const currentTime = Math.floor(Date.now() / 1000) + this.timeOffset;
-        for (let window = -2; window <= 2; window++) {
-            const time = currentTime + (window * 30);
-            const token = speakeasy.totp({ secret: secret, encoding: 'base32', time: time, step: 30 });
-            if (!tokens.includes(token)) tokens.push(token);
-        }
-        return tokens;
-    }
-
     private tryTOTPWithRetry = async (secret: string): Promise<string> => {
         try {
             const token = this.generateRobustTOTP(secret);
+            console.log('🔐 Code TOTP généré:', token);
             return token;
         } catch (error) {
-            console.error('❌ Erreur génération TOTP robuste:', error);
+            console.error('❌ Erreur génération TOTP:', error);
         }
         
-        try {
-            const tokens = this.generateTOTPWithMultipleWindows(secret);
-            if (tokens.length > 0) return tokens[0];
-        } catch (error) {
-            console.error('❌ Erreur génération TOTP multi-fenêtres:', error);
-        }
-        
-        const offsets = [-90, -60, -30, 30, 60, 90];
-        console.log('🔐 Essai avec décalages...');
-        for (const offset of offsets) {
-            try {
-                const adjustedTime = Math.floor(Date.now() / 1000) + this.timeOffset + offset;
-                const token = speakeasy.totp({ secret: secret, encoding: 'base32', time: adjustedTime, step: 30 });
-                return token;
-            } catch (error) {
-                continue;
-            }
-        }
-        
-        console.error('❌ Impossible de générer un code TOTP');
         return '';
     }
 
