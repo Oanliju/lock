@@ -1,4 +1,3 @@
-// src/main.ts
 import { Lock, LockConfig } from './index';
 import express from 'express';
 import http from 'http';
@@ -15,7 +14,8 @@ app.get('/health', (req, res) => {
     res.status(200).json({ 
         status: 'OK', 
         message: 'LockURL service is running',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        method: process.env.DISCORD_PASSWORD ? 'password_auth' : 'token_only'
     });
 });
 
@@ -24,17 +24,19 @@ app.get('/', (req, res) => {
     res.json({
         service: 'Discord Vanity URL Locker',
         status: 'active',
+        auth_method: process.env.DISCORD_PASSWORD ? 'password_based' : 'token_only',
         endpoints: ['/health', '/status']
     });
 });
 
-// Configuration (REMOVED passOrKey)
+// Configuration avec support du mot de passe
 const config: LockConfig = {
     token: process.env.DISCORD_TOKEN || "",
     tokenBot: process.env.DISCORD_BOT_TOKEN || "",
     guildId: process.env.GUILD_ID || "",
     url: process.env.VANITY_URL || "",
-    webhook: process.env.WEBHOOK_URL || ""
+    webhook: process.env.WEBHOOK_URL || "",
+    password: process.env.DISCORD_PASSWORD || undefined
 };
 
 let lockInstance: Lock;
@@ -42,6 +44,8 @@ let lockInstance: Lock;
 const createLockInstance = () => {
     try {
         console.log('🔄 Initialisation du Lock...');
+        console.log(`🔐 Méthode d'authentification: ${config.password ? 'MOT DE PASSE + TOKEN' : 'TOKEN SEUL'}`);
+        
         lockInstance = new Lock(config);
         console.log('✅ Lock initialisé avec succès');
     } catch (error) {
@@ -56,6 +60,7 @@ const server = http.createServer(app);
 server.listen(PORT, () => {
     console.log(`🚀 Serveur démarré sur le port ${PORT}`);
     console.log(`📍 Health check: http://localhost:${PORT}/health`);
+    console.log(`🔐 Authentification: ${config.password ? 'AVEC MOT DE PASSE' : 'TOKEN SEUL'}`);
     
     // Démarrer l'instance Lock après le démarrage du serveur
     createLockInstance();

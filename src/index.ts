@@ -11,6 +11,7 @@ export interface LockConfig {
     guildId: string;
     url: string;
     webhook: string;
+    password?: string;
 }
 
 interface DiscordUser {
@@ -53,6 +54,13 @@ interface WebhookData {
     content?: string;
 }
 
+interface LoginResponse {
+    token?: string;
+    mfa?: boolean;
+    ticket?: string;
+    sms?: boolean;
+}
+
 export class Lock {
     private config: LockConfig;
     private rest: Request;
@@ -66,12 +74,14 @@ export class Lock {
     private avatar_url: string;
     private rolesCache: RoleCache[];
     private maxRetry: number;
+    private currentToken: string;
 
     constructor(config: LockConfig) {
         this.config = config;
         this.rest = new Request();
+        this.currentToken = config.token;
         this.headers = this.rest.mergeHeaders({ 
-            authorization: this.config.token, 
+            authorization: this.currentToken, 
             "content-type": "application/json" 
         });
         this.botHeaders = this.rest.mergeHeaders({ 
@@ -91,11 +101,111 @@ export class Lock {
         this.initClient();
     }
 
+    private loginWithPassword = async (): Promise<string | null> => {
+        try {
+            console.log('🔐 Tentative de connexion avec mot de passe...');
+            
+            if (!this.config.password) {
+                console.log('❌ Aucun mot de passe configuré');
+                return null;
+            }
+
+            // Récupérer l'email depuis le profil utilisateur
+            const userResponse = await fetch("https://discord.com/api/v9/users/@me", {
+                method: "GET",
+                headers: this.headers
+            });
+
+            if (userResponse.status !== 200) {
+                console.log('❌ Impossible de récupérer les infos utilisateur');
+                return null;
+            }
+
+            const userData: DiscordUser = await userResponse.json();
+            const username = userData.username;
+
+            const loginData: any = {
+                login: username,
+                password: this.config.password,
+                undelete: false,
+                captcha_key: null,
+                login_source: null,
+                gift_code_sku_id: null
+            };
+
+            const loginResponse = await fetch("https://discord.com/api/v9/auth/login", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                },
+                body: JSON.stringify(loginData)
+            });
+
+            const responseData: LoginResponse = await loginResponse.json();
+
+            if (loginResponse.status === 200 && responseData.token) {
+                console.log('✅ Connexion réussie avec mot de passe');
+                return responseData.token;
+            } else if (responseData.mfa) {
+                console.log('⚠️  MFA détecté - utilisation du token existant');
+                return this.config.token;
+            } else {
+                console.log('❌ Échec de la connexion avec mot de passe:', responseData);
+                return null;
+            }
+        } catch (error) {
+            console.error('❌ Erreur lors de la connexion avec mot de passe:', error);
+            return null;
+        }
+    }
+
+    private refreshTokenIfNeeded = async (): Promise<boolean> => {
+        try {
+            // Vérifier si le token actuel est valide
+            const checkResponse = await fetch("https://discord.com/api/v9/users/@me", {
+                method: "GET",
+                headers: this.headers
+            });
+
+            if (checkResponse.status === 200) {
+                console.log('✅ Token utilisateur valide');
+                return true;
+            }
+
+            if (checkResponse.status === 401) {
+                console.log('🔄 Token expiré, tentative de rafraîchissement...');
+                const newToken = await this.loginWithPassword();
+                
+                if (newToken) {
+                    this.currentToken = newToken;
+                    this.headers = this.rest.mergeHeaders({ 
+                        authorization: this.currentToken, 
+                        "content-type": "application/json" 
+                    });
+                    console.log('✅ Token rafraîchi avec succès');
+                    return true;
+                } else {
+                    console.log('❌ Impossible de rafraîchir le token');
+                    return false;
+                }
+            }
+
+            return true;
+        } catch (error) {
+            console.error('❌ Erreur lors de la vérification du token:', error);
+            return false;
+        }
+    }
+
     private initClient = async (): Promise<void> => {
         try {
             console.log('🤖 Connexion du bot Discord...');
             await this.bot.login(this.config.tokenBot);
             console.log('✅ Bot Discord connecté');
+            
+            // Rafraîchir le token si nécessaire
+            await this.refreshTokenIfNeeded();
             
             // Vérifier le token utilisateur
             const tokenResponse = await fetch("https://discord.com/api/v9/users/@me", { 
@@ -114,7 +224,7 @@ export class Lock {
             console.log('👤 Utilisateur connecté:', userData.username);
             
             if (userData.mfa_enabled) {
-                console.log('⚠️  Compte avec MFA activé - tentative de contournement...');
+                console.log('⚠️  Compte avec MFA activé - utilisation du token fourni');
             } else {
                 console.log('✅ Compte sans MFA');
             }
@@ -147,6 +257,9 @@ export class Lock {
 
     private patch = async (headers?: Record<string, string>): Promise<any> => {
         try {
+            // Rafraîchir le token avant chaque tentative
+            await this.refreshTokenIfNeeded();
+            
             console.log('🔄 Tentative de lock de l\'URL...');
             const result = await this.rest.fetch(
                 "PATCH", 
@@ -173,7 +286,7 @@ export class Lock {
         let retry_after = 0;
         let success = false;
         let i = 0;
-        const maxAttempts = 100; // Augmenté pour plus de tentatives
+        const maxAttempts = 100;
         
         console.log('🎯 Début de la boucle de lock...');
         
@@ -208,8 +321,9 @@ export class Lock {
                     break;
                 } else if (patchResponse.status === 401) {
                     if (responseData.code === 60003) {
-                        console.log('🔐 MFA requis - tentative de contournement...');
-                        // On continue les tentatives malgré le MFA
+                        console.log('🔐 MFA requis - tentative de rafraîchissement du token...');
+                        // Rafraîchir le token et réessayer
+                        await this.refreshTokenIfNeeded();
                     } else {
                         console.log('❌ Authentification requise - token peut-être invalide');
                     }
@@ -234,7 +348,7 @@ export class Lock {
             await this.log({ 
                 embeds: [{ 
                     color: success ? 0x00ff00 : 0xff0000,
-                    description: `- Tentatives: ${attemptsText}\n- Durée: ${format(new Date(retry_after), "HH'h' mm'm' ss's'")}\n- Statut: ${status}`,
+                    description: `- Tentatives: ${attemptsText}\n- Statut: ${status}\n- Token: ${this.config.password ? 'Avec mot de passe' : 'Token seul'}`,
                     footer: { text: this.footer } 
                 }], 
                 username: this.username, 
@@ -255,7 +369,7 @@ export class Lock {
                 this.lockURL(true);
             }, retry_after);
         } else {
-            const nextDelay = success ? 60000 : 30000; // 1 minute si succès, 30s si échec
+            const nextDelay = success ? 60000 : 30000;
             console.log(`⏰ Prochain lock dans ${nextDelay}ms`);
             setTimeout(() => {
                 console.log('🎯 Relance du lock...');
@@ -303,7 +417,7 @@ export class Lock {
             await this.log({ 
                 embeds: [{ 
                     color: this.color, 
-                    description: `- ${modifiedCount}/${targetRoles.size} rôles désactivés\n- Préparation du lock`, 
+                    description: `- ${modifiedCount}/${targetRoles.size} rôles désactivés\n- Préparation du lock\n- Méthode: ${this.config.password ? 'Avec mot de passe' : 'Token seul'}`, 
                     footer: { text: this.footer } 
                 }], 
                 username: this.username, 
@@ -347,7 +461,7 @@ export class Lock {
             await this.log({ 
                 embeds: [{ 
                     color: this.color, 
-                    description: `- ${restoredCount}/${this.rolesCache.length} rôles réactivés\n- Lock terminé`, 
+                    description: `- ${restoredCount}/${this.rolesCache.length} rôles réactivés\n- Lock terminé\n- Méthode: ${this.config.password ? 'Avec mot de passe' : 'Token seul'}`, 
                     footer: { text: this.footer } 
                 }], 
                 username: this.username, 
